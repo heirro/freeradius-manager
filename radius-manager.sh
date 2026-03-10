@@ -1,0 +1,1027 @@
+#!/bin/bash
+
+# ============================================
+# FreeRADIUS Multi-Instance Manager v3
+# - Buat instance + database otomatis
+# - NAS didaftarkan manual ke tabel nas
+# ============================================
+
+set -uo pipefail
+trap 'error "Script berhenti di baris $LINENO — exit code: $?"' ERR
+
+# ============================================
+# CONFIGURATION
+# ============================================
+FREERADIUS_DIR="/etc/freeradius/3.0"
+MODS_AVAILABLE="$FREERADIUS_DIR/mods-available"
+MODS_ENABLED="$FREERADIUS_DIR/mods-enabled"
+SITES_AVAILABLE="$FREERADIUS_DIR/sites-available"
+SITES_ENABLED="$FREERADIUS_DIR/sites-enabled"
+LOG_DIR="/var/log/freeradius"
+FR_USER="freerad"
+FR_GROUP="freerad"
+
+DB_HOST="localhost"
+DB_PORT="53360"
+DB_SOCKET="/var/run/mysqld/mysqld.sock"
+
+DB_REMOTE_HOST="%"
+ALLOW_REMOTE_DB=true
+
+PORT_AUTH_START=11000
+PORT_AUTH_STEP=10
+PORT_REGISTRY="$FREERADIUS_DIR/.port_registry"
+FR_SCHEMA="$FREERADIUS_DIR/mods-config/sql/main/mysql/schema.sql"
+
+# ============================================
+# COLORS
+# ============================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
+success() { echo -e "${GREEN}[OK]${NC}    $*"; }
+warning() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+error()   { echo -e "${RED}[ERROR]${NC} $*"; }
+header()  { echo -e "${CYAN}$*${NC}"; }
+
+# ============================================
+# FUNCTION: Check Root
+# ============================================
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        error "Script harus dijalankan sebagai root!"
+        exit 1
+    fi
+    success "Running as root"
+}
+
+# ============================================
+# FUNCTION: MySQL via Unix Socket
+# ============================================
+mysql_cmd() {
+    mariadb -u root "$@"
+}
+
+# ============================================
+# FUNCTION: Test MariaDB
+# ============================================
+test_mariadb() {
+    info "Testing MariaDB connection..."
+    if mysql_cmd -e "SELECT 1;" >/dev/null 2>&1; then
+        success "MariaDB OK"
+        return 0
+    else
+        error "Tidak bisa konek ke MariaDB!"
+        error "Cek: systemctl status mariadb"
+        error "Cek socket: ls -la ${DB_SOCKET}"
+        return 1
+    fi
+}
+
+# ============================================
+# FUNCTION: Generate Password
+# Pakai openssl agar tidak ada SIGPIPE
+# ============================================
+generate_password() {
+    openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20
+}
+
+# ============================================
+# FUNCTION: Auto-Assign Port
+# ============================================
+find_available_port() {
+    local port=$PORT_AUTH_START
+    touch "$PORT_REGISTRY"
+
+    while true; do
+        # Cek registry
+        if grep -q "^${port} " "$PORT_REGISTRY" 2>/dev/null; then
+            port=$((port + PORT_AUTH_STEP)); continue
+        fi
+        # Cek port auth di sistem
+        if ss -tulnp 2>/dev/null | grep -q ":${port} "; then
+            port=$((port + PORT_AUTH_STEP)); continue
+        fi
+        # Cek port acct (auth+1)
+        if ss -tulnp 2>/dev/null | grep -q ":$((port + 1)) "; then
+            port=$((port + PORT_AUTH_STEP)); continue
+        fi
+        echo "$port"
+        return 0
+    done
+}
+
+register_port() {
+    local port=$1 admin=$2
+    touch "$PORT_REGISTRY"
+    echo "${port} # ${admin} auth"           >> "$PORT_REGISTRY"
+    echo "$((port + 1)) # ${admin} acct"     >> "$PORT_REGISTRY"
+    echo "$((port + 2000)) # ${admin} coa"   >> "$PORT_REGISTRY"
+    echo "$((port + 5000)) # ${admin} inner" >> "$PORT_REGISTRY"
+}
+
+unregister_port() {
+    local admin=$1
+    [ -f "$PORT_REGISTRY" ] && sed -i "/ # ${admin} /d" "$PORT_REGISTRY"
+}
+
+# ============================================
+# FUNCTION: Create Database & User
+# ============================================
+create_database() {
+    local DB_NAME=$1 DB_USER=$2 DB_PASS=$3
+
+    info "Creating database: $DB_NAME"
+
+    if mysql_cmd -e "USE \`${DB_NAME}\`;" 2>/dev/null; then
+        warning "Database '${DB_NAME}' sudah ada, skip"
+    else
+        mysql_cmd -e "CREATE DATABASE \`${DB_NAME}\`
+            CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        success "Database '${DB_NAME}' dibuat"
+    fi
+
+    # User localhost
+    local user_local
+    user_local=$(mysql_cmd -se \
+        "SELECT COUNT(*) FROM mysql.user
+         WHERE user='${DB_USER}' AND host='localhost';" 2>/dev/null || echo "0")
+
+    if [ "${user_local:-0}" -gt 0 ]; then
+        warning "User '${DB_USER}'@'localhost' sudah ada, update password"
+        mysql_cmd -e "ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+    else
+        mysql_cmd -e "CREATE USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+        success "User '${DB_USER}'@'localhost' dibuat"
+    fi
+    mysql_cmd -e "GRANT SELECT,INSERT,UPDATE,DELETE ON \`${DB_NAME}\`.*
+        TO '${DB_USER}'@'localhost';"
+
+    # User remote
+    if [ "${ALLOW_REMOTE_DB}" = true ]; then
+        local user_remote
+        user_remote=$(mysql_cmd -se \
+            "SELECT COUNT(*) FROM mysql.user
+             WHERE user='${DB_USER}' AND host='${DB_REMOTE_HOST}';" \
+            2>/dev/null || echo "0")
+
+        if [ "${user_remote:-0}" -gt 0 ]; then
+            warning "User '${DB_USER}'@'${DB_REMOTE_HOST}' sudah ada, update password"
+            mysql_cmd -e "ALTER USER '${DB_USER}'@'${DB_REMOTE_HOST}'
+                IDENTIFIED BY '${DB_PASS}';"
+        else
+            mysql_cmd -e "CREATE USER '${DB_USER}'@'${DB_REMOTE_HOST}'
+                IDENTIFIED BY '${DB_PASS}';"
+            success "User '${DB_USER}'@'${DB_REMOTE_HOST}' dibuat (remote)"
+        fi
+        mysql_cmd -e "GRANT SELECT,INSERT,UPDATE,DELETE ON \`${DB_NAME}\`.*
+            TO '${DB_USER}'@'${DB_REMOTE_HOST}';"
+    fi
+
+    mysql_cmd -e "FLUSH PRIVILEGES;"
+    success "Database & user selesai"
+}
+
+# ============================================
+# FUNCTION: Drop Database & User
+# ============================================
+drop_database() {
+    local DB_NAME=$1 DB_USER=$2
+
+    echo ""
+    warning "PERHATIAN! Akan menghapus:"
+    echo "    Database : $DB_NAME"
+    echo "    User     : ${DB_USER}@localhost"
+    [ "${ALLOW_REMOTE_DB}" = true ] && \
+        echo "    User     : ${DB_USER}@${DB_REMOTE_HOST}"
+    echo ""
+    read -r -p "Yakin hapus database & user? [y/N] " confirm
+    echo ""
+    [[ ! "${confirm}" =~ ^[Yy]$ ]] && { info "Skip hapus database"; return 0; }
+
+    if mysql_cmd -e "USE \`${DB_NAME}\`;" 2>/dev/null; then
+        mysql_cmd -e "DROP DATABASE \`${DB_NAME}\`;"
+        success "Database '${DB_NAME}' dihapus"
+    else
+        warning "Database '${DB_NAME}' tidak ditemukan, skip"
+    fi
+
+    local user_local
+    user_local=$(mysql_cmd -se \
+        "SELECT COUNT(*) FROM mysql.user
+         WHERE user='${DB_USER}' AND host='localhost';" 2>/dev/null || echo "0")
+    if [ "${user_local:-0}" -gt 0 ]; then
+        mysql_cmd -e "DROP USER '${DB_USER}'@'localhost';"
+        success "User '${DB_USER}'@'localhost' dihapus"
+    else
+        warning "User '${DB_USER}'@'localhost' tidak ditemukan, skip"
+    fi
+
+    if [ "${ALLOW_REMOTE_DB}" = true ]; then
+        local user_remote
+        user_remote=$(mysql_cmd -se \
+            "SELECT COUNT(*) FROM mysql.user
+             WHERE user='${DB_USER}' AND host='${DB_REMOTE_HOST}';" \
+            2>/dev/null || echo "0")
+        if [ "${user_remote:-0}" -gt 0 ]; then
+            mysql_cmd -e "DROP USER '${DB_USER}'@'${DB_REMOTE_HOST}';"
+            success "User '${DB_USER}'@'${DB_REMOTE_HOST}' dihapus"
+        else
+            warning "User remote tidak ditemukan, skip"
+        fi
+    fi
+
+    mysql_cmd -e "FLUSH PRIVILEGES;"
+    success "Database & user selesai dihapus"
+}
+
+# ============================================
+# FUNCTION: Import Schema
+# ============================================
+import_schema() {
+    local DB_NAME=$1
+
+    info "Importing FreeRADIUS schema ke: $DB_NAME"
+
+    local table_exists
+    table_exists=$(mysql_cmd "${DB_NAME}" -se \
+        "SHOW TABLES LIKE 'radcheck';" 2>/dev/null || echo "")
+
+    if [ -n "$table_exists" ]; then
+        warning "Schema sudah ada, skip"
+        return 0
+    fi
+
+    if [ ! -f "$FR_SCHEMA" ]; then
+        error "Schema tidak ditemukan: $FR_SCHEMA"
+        error "Install: apt install freeradius-mysql"
+        return 1
+    fi
+
+    mysql_cmd "$DB_NAME" < "$FR_SCHEMA"
+    success "Schema diimport ke '${DB_NAME}'"
+    info "Tabel:"
+    mysql_cmd "$DB_NAME" -e "SHOW TABLES;" | sed 's/^/    /'
+}
+
+# ============================================
+# FUNCTION: Create SQL Module
+# ============================================
+create_sql_module() {
+    local ADMIN_USERNAME=$1 DB_NAME=$2 DB_USER=$3 DB_PASS=$4
+    local MODULE_NAME="sql_${ADMIN_USERNAME}"
+    local MODULE_FILE="$MODS_AVAILABLE/$MODULE_NAME"
+
+    info "Creating SQL module: $MODULE_NAME"
+
+    cat > "$MODULE_FILE" << EOF
+sql ${MODULE_NAME} {
+    dialect = "mysql"
+    driver  = "rlm_sql_\${dialect}"
+
+    mysql {
+        warnings = auto
+    }
+
+    server    = "${DB_HOST}"
+    port      = ${DB_PORT}
+    login     = "${DB_USER}"
+    password  = "${DB_PASS}"
+    radius_db = "${DB_NAME}"
+
+    sql_user_name = "%{User-Name}"
+
+    acct_table1      = "radacct"
+    acct_table2      = "radacct"
+    postauth_table   = "radpostauth"
+    authcheck_table  = "radcheck"
+    groupcheck_table = "radgroupcheck"
+    authreply_table  = "radreply"
+    groupreply_table = "radgroupreply"
+    usergroup_table  = "radusergroup"
+
+    read_clients          = yes
+    client_table          = "nas"
+    read_groups           = yes
+    read_profiles         = yes
+    delete_stale_sessions = yes
+
+    group_attribute = "${MODULE_NAME}-SQL-Group"
+
+    safe_characters = "@abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_: /"
+
+    pool {
+        start        = 3
+        min          = 2
+        max          = 10
+        spare        = 3
+        uses         = 0
+        retry_delay  = 30
+        lifetime     = 0
+        idle_timeout = 60
+        max_retries  = 5
+    }
+
+    \$INCLUDE \${modconfdir}/sql/main/\${dialect}/queries.conf
+}
+EOF
+
+    ln -sf "$MODULE_FILE" "$MODS_ENABLED/$MODULE_NAME"
+    chown -h "${FR_USER}:${FR_GROUP}" "$MODS_ENABLED/$MODULE_NAME"
+    success "SQL module: $MODULE_NAME"
+}
+
+# ============================================
+# FUNCTION: Create EAP Module
+# FIX: store syntax v3 pakai = bukan { }
+# ============================================
+create_eap_module() {
+    local ADMIN_USERNAME=$1 INNER_PORT=$2
+    local MODULE_NAME="eap_${ADMIN_USERNAME}"
+    local MODULE_FILE="$MODS_AVAILABLE/$MODULE_NAME"
+
+    info "Creating EAP module: $MODULE_NAME"
+
+    cat > "$MODULE_FILE" << EOF
+eap ${MODULE_NAME} {
+    default_eap_type              = ttls
+    timer_expire                  = 60
+    ignore_unknown_eap_types      = no
+    cisco_accounting_username_bug = no
+    max_sessions                  = \${max_requests}
+
+    md5 { }
+
+    gtc {
+        auth_type = PAP
+    }
+
+    tls-config tls-${ADMIN_USERNAME} {
+        private_key_password = whatever
+        private_key_file     = /etc/ssl/private/ssl-cert-snakeoil.key
+        certificate_file     = /etc/ssl/certs/ssl-cert-snakeoil.pem
+        ca_file              = /etc/ssl/certs/ca-certificates.crt
+        ca_path              = \${cadir}
+        cipher_list          = "DEFAULT"
+        tls_min_version      = "1.2"
+        tls_max_version      = "1.3"
+        ecdh_curve           = ""
+
+        cache {
+            enable   = no
+            lifetime = 24
+            store    = "Tunnel-Private-Group-Id"
+        }
+
+        verify { }
+
+        ocsp {
+            enable            = no
+            override_cert_url = yes
+            url               = "http://127.0.0.1/ocsp/"
+        }
+    }
+
+    tls {
+        tls = tls-${ADMIN_USERNAME}
+    }
+
+    ttls {
+        tls                    = tls-${ADMIN_USERNAME}
+        default_eap_type       = md5
+        copy_request_to_tunnel = no
+        use_tunneled_reply     = yes
+        virtual_server         = "inner-tunnel-${ADMIN_USERNAME}"
+    }
+
+    peap {
+        tls                    = tls-${ADMIN_USERNAME}
+        default_eap_type       = mschapv2
+        copy_request_to_tunnel = no
+        use_tunneled_reply     = yes
+        virtual_server         = "inner-tunnel-${ADMIN_USERNAME}"
+    }
+
+    mschapv2 { }
+}
+EOF
+
+    ln -sf "$MODULE_FILE" "$MODS_ENABLED/$MODULE_NAME"
+    chown -h "${FR_USER}:${FR_GROUP}" "$MODS_ENABLED/$MODULE_NAME"
+    success "EAP module: $MODULE_NAME"
+}
+
+# ============================================
+# FUNCTION: Create Inner Tunnel
+# ============================================
+create_inner_tunnel() {
+    local ADMIN_USERNAME=$1 INNER_PORT=$2
+    local SERVER_FILE="$SITES_AVAILABLE/inner-tunnel-${ADMIN_USERNAME}"
+
+    info "Creating inner tunnel: port $INNER_PORT"
+
+    cat > "$SERVER_FILE" << EOF
+server inner-tunnel-${ADMIN_USERNAME} {
+
+    listen {
+        ipaddr = 127.0.0.1
+        port   = ${INNER_PORT}
+        type   = auth
+    }
+
+    authorize {
+        filter_username
+        chap
+        mschap
+        update control {
+            &Proxy-To-Realm := LOCAL
+        }
+        eap_${ADMIN_USERNAME} {
+            ok = return
+        }
+        sql_${ADMIN_USERNAME}
+        pap
+    }
+
+    authenticate {
+        Auth-Type PAP {
+            pap
+        }
+        Auth-Type CHAP {
+            chap
+        }
+        Auth-Type MS-CHAP {
+            mschap
+        }
+        eap_${ADMIN_USERNAME}
+    }
+
+    session {
+        sql_${ADMIN_USERNAME}
+    }
+
+    post-auth {
+        sql_${ADMIN_USERNAME}
+        Post-Auth-Type REJECT {
+            sql_${ADMIN_USERNAME}
+            attr_filter.access_reject
+        }
+    }
+}
+EOF
+
+    ln -sf "$SERVER_FILE" "$SITES_ENABLED/inner-tunnel-${ADMIN_USERNAME}"
+    chown -h "${FR_USER}:${FR_GROUP}" "$SITES_ENABLED/inner-tunnel-${ADMIN_USERNAME}"
+    success "Inner tunnel: inner-tunnel-${ADMIN_USERNAME}"
+}
+
+# ============================================
+# FUNCTION: Create Virtual Server
+# ============================================
+create_virtual_server() {
+    local ADMIN_USERNAME=$1 AUTH_PORT=$2
+    local ACCT_PORT=$((AUTH_PORT + 1))
+    local COA_PORT=$((AUTH_PORT + 2000))
+    local SERVER_NAME="${ADMIN_USERNAME}"          # <-- TANPA prefix pppoe_
+    local SERVER_FILE="$SITES_AVAILABLE/$SERVER_NAME"
+
+    info "Creating virtual server: $SERVER_NAME"
+    info "  Auth : $AUTH_PORT | Acct : $ACCT_PORT | CoA : $COA_PORT"
+
+    cat > "$SERVER_FILE" << EOF
+server ${SERVER_NAME} {
+
+    # ============================================
+    # NAS dibaca dari tabel nas di database
+    # Tambahkan manual:
+    #
+    # USE ${ADMIN_USERNAME};
+    # INSERT INTO nas (nasname, shortname, type, secret, server)
+    # VALUES ('IP_MIKROTIK', 'nama', 'other', 'secret', '${SERVER_NAME}');
+    # ============================================
+
+    listen {
+        type   = auth
+        ipaddr = *
+        port   = ${AUTH_PORT}
+        limit {
+            max_connections = 16
+            lifetime        = 0
+            idle_timeout    = 30
+        }
+    }
+
+    listen {
+        type   = acct
+        ipaddr = *
+        port   = ${ACCT_PORT}
+        limit {
+            max_connections = 16
+            lifetime        = 0
+            idle_timeout    = 30
+        }
+    }
+
+    listen {
+        type   = coa
+        ipaddr = *
+        port   = ${COA_PORT}
+        limit {
+            max_connections = 16
+            lifetime        = 0
+            idle_timeout    = 30
+        }
+    }
+
+    authorize {
+        filter_username
+        preprocess
+        chap
+        mschap
+        digest
+        eap_${ADMIN_USERNAME} {
+            ok = return
+        }
+        files
+        sql_${ADMIN_USERNAME}
+        expiration
+        logintime
+        pap
+        Autz-Type New-TLS-Connection {
+            ok
+        }
+    }
+
+    authenticate {
+        Auth-Type PAP {
+            pap
+        }
+        Auth-Type CHAP {
+            chap
+        }
+        Auth-Type MS-CHAP {
+            mschap
+        }
+        mschap
+        digest
+        eap_${ADMIN_USERNAME}
+    }
+
+    preacct {
+        preprocess
+        acct_unique
+        files
+    }
+
+    accounting {
+        detail
+        sql_${ADMIN_USERNAME}
+        exec
+        attr_filter.accounting_response
+    }
+
+    session {
+        sql_${ADMIN_USERNAME}
+    }
+
+    post-auth {
+        if (session-state:User-Name && reply:User-Name && request:User-Name && (reply:User-Name == request:User-Name)) {
+            update reply {
+                &User-Name !* ANY
+            }
+        }
+        update {
+            &reply: += &session-state:
+        }
+        sql_${ADMIN_USERNAME}
+        exec
+        remove_reply_message_if_eap
+        Post-Auth-Type REJECT {
+            sql_${ADMIN_USERNAME}
+            attr_filter.access_reject
+            eap_${ADMIN_USERNAME}
+            remove_reply_message_if_eap
+        }
+        Post-Auth-Type Challenge {
+        }
+    }
+
+    recv-coa {
+        ok
+    }
+
+    send-coa {
+        ok
+    }
+}
+EOF
+
+    ln -sf "$SERVER_FILE" "$SITES_ENABLED/$SERVER_NAME"
+    chown -h "${FR_USER}:${FR_GROUP}" "$SITES_ENABLED/$SERVER_NAME"
+    success "Virtual server: $SERVER_NAME"
+}
+
+# ============================================
+# FUNCTION: Create Log Dir
+# ============================================
+create_log_dir() {
+    local A=$1
+    mkdir -p "$LOG_DIR/radacct-${A}"
+    chown -R "${FR_USER}:${FR_GROUP}" "$LOG_DIR/radacct-${A}"
+    chmod 750 "$LOG_DIR/radacct-${A}"
+    success "Log dir: $LOG_DIR/radacct-${A}"
+}
+
+# ============================================
+# FUNCTION: Restart FreeRADIUS
+# ============================================
+restart_freeradius() {
+    info "Testing FreeRADIUS config..."
+
+    local TEST_OUTPUT
+    TEST_OUTPUT=$(freeradius -XC 2>&1) || true
+
+    if echo "$TEST_OUTPUT" | grep -q "Configuration appears to be OK"; then
+        success "Config OK"
+    else
+        error "Config FAILED!"
+        echo "$TEST_OUTPUT" | grep -iE "error|failed" | head -20
+        return 1
+    fi
+
+    info "Restarting FreeRADIUS..."
+    systemctl restart freeradius
+    sleep 2
+
+    if systemctl is-active --quiet freeradius; then
+        success "FreeRADIUS restarted OK"
+    else
+        error "FreeRADIUS gagal start!"
+        journalctl -xeu freeradius.service --no-pager | tail -20
+        return 1
+    fi
+}
+
+# ============================================
+# FUNCTION: Delete Config
+# ============================================
+delete_config() {
+    local A=$1
+    info "Removing config: $A"
+    rm -f "$MODS_ENABLED/sql_${A}"         "$MODS_ENABLED/eap_${A}"
+    rm -f "$SITES_ENABLED/${A}"            "$SITES_ENABLED/inner-tunnel-${A}"
+    rm -f "$MODS_AVAILABLE/sql_${A}"       "$MODS_AVAILABLE/eap_${A}"
+    rm -f "$SITES_AVAILABLE/${A}"          "$SITES_AVAILABLE/inner-tunnel-${A}"
+    unregister_port "$A"
+    success "Config deleted: $A"
+}
+
+# ============================================
+# FUNCTION: Stop / Start
+# ============================================
+stop_instance() {
+    local A=$1
+    rm -f "$MODS_ENABLED/sql_${A}"         "$MODS_ENABLED/eap_${A}"
+    rm -f "$SITES_ENABLED/${A}"            "$SITES_ENABLED/inner-tunnel-${A}"
+    success "Instance '$A' stopped"
+}
+
+start_instance() {
+    local A=$1
+    [ -f "$SITES_AVAILABLE/${A}" ] || {
+        error "Config tidak ada! Jalankan '$0 create ${A}' dulu."
+        return 1
+    }
+    ln -sf "$MODS_AVAILABLE/sql_${A}"           "$MODS_ENABLED/sql_${A}"
+    ln -sf "$MODS_AVAILABLE/eap_${A}"           "$MODS_ENABLED/eap_${A}"
+    ln -sf "$SITES_AVAILABLE/inner-tunnel-${A}" "$SITES_ENABLED/inner-tunnel-${A}"
+    ln -sf "$SITES_AVAILABLE/${A}"              "$SITES_ENABLED/${A}"
+    chown -h "${FR_USER}:${FR_GROUP}" \
+        "$MODS_ENABLED/sql_${A}"             \
+        "$MODS_ENABLED/eap_${A}"             \
+        "$SITES_ENABLED/inner-tunnel-${A}"   \
+        "$SITES_ENABLED/${A}"
+    success "Instance '$A' started"
+}
+
+# ============================================
+# FUNCTION: List Instances
+# ============================================
+list_instances() {
+    echo ""
+    header "======================================================"
+    header "  FreeRADIUS Instances"
+    header "======================================================"
+
+    local found=0
+    for INFO_FILE in "$FREERADIUS_DIR"/.instance_*; do
+        [ -f "$INFO_FILE" ] || continue
+        found=1
+
+        # Baca variabel dari file info
+        local ADMIN_USERNAME DB_NAME AUTH_PORT ACCT_PORT COA_PORT
+        source "$INFO_FILE"
+
+        local f="$SITES_AVAILABLE/${ADMIN_USERNAME}"
+        local st; [ -L "$SITES_ENABLED/${ADMIN_USERNAME}" ] && \
+            st="${GREEN}ENABLED${NC}" || st="${YELLOW}STOPPED${NC}"
+        local as; ss -tulnp 2>/dev/null | grep -q ":${AUTH_PORT} " && \
+            as="${GREEN}LISTEN${NC}" || as="${RED}DOWN${NC}"
+        local cs; ss -tulnp 2>/dev/null | grep -q ":${ACCT_PORT} " && \
+            cs="${GREEN}LISTEN${NC}" || cs="${RED}DOWN${NC}"
+
+        echo ""
+        echo -e "  Instance  : ${BLUE}${ADMIN_USERNAME}${NC}  [${st}]"
+        echo    "  Database  : ${DB_NAME}"
+        echo -e "  Auth Port : ${AUTH_PORT}  [${as}]"
+        echo -e "  Acct Port : ${ACCT_PORT}  [${cs}]  (auth+1)"
+        echo -e "  CoA  Port : ${COA_PORT}  (auth+2000)"
+    done
+
+    [ $found -eq 0 ] && warning "Tidak ada instance"
+    echo ""
+    header "======================================================"
+    echo ""
+}
+
+# ============================================
+# FUNCTION: Test Instance
+# ============================================
+test_instance() {
+    local A=$1
+    local f="$SITES_AVAILABLE/${A}"
+    [ -f "$f" ] || { error "Instance tidak ditemukan: $A"; return 1; }
+    local ap; ap=$(grep -A3 "type = auth" "$f" | grep "port" | head -1 | awk '{print $3}')
+    info "Testing $A — port $ap"
+    ss -tulnp 2>/dev/null | grep -q ":${ap} " && \
+        success "Port $ap LISTENING" || { error "Port $ap NOT listening!"; return 1; }
+    if command -v radtest &>/dev/null; then
+        echo ""
+        info "Test Access-Request..."
+        radtest testuser testpass "localhost:${ap}" 0 testing123 || true
+    else
+        warning "radtest tidak ada: apt install freeradius-utils"
+    fi
+}
+
+# ============================================
+# FUNCTION: Test Disconnect
+# ============================================
+test_disconnect() {
+    local A=$1 U=$2 S=$3
+    local f="$SITES_AVAILABLE/${A}"
+    [ -f "$f" ] || { error "Instance tidak ditemukan: $A"; return 1; }
+    local cp; cp=$(grep -A3 "type = coa" "$f" | grep "port" | head -1 | awk '{print $3}')
+    command -v radclient &>/dev/null || { error "radclient tidak ada"; return 1; }
+    printf "User-Name=%s\nAcct-Session-Id=%s\n" "$U" "$S" | \
+        radclient "127.0.0.1:${cp}" disconnect testing123
+}
+
+# ============================================
+# MAIN
+# ============================================
+check_root
+
+case "${1:-}" in
+
+    # ------------------------------------------
+    create)
+        if [ $# -lt 2 ]; then
+            echo ""
+            echo "Usage: $0 create <admin_username> [db_pass]"
+            echo ""
+            echo "  admin_username : nama instance & database"
+            echo "  db_pass        : password DB (opsional, auto-generate)"
+            echo ""
+            echo "Contoh:"
+            echo "  $0 create replaymedia"
+            echo "  $0 create baimnabil MyPass123"
+            echo ""
+            exit 1
+        fi
+
+        ADMIN_USERNAME=$2
+        DB_NAME="${ADMIN_USERNAME}"
+        DB_USER="${ADMIN_USERNAME}"
+        DB_PASS="${3:-$(generate_password)}"
+
+        info "Mencari port kosong..."
+        AUTH_PORT=$(find_available_port)
+        ACCT_PORT=$((AUTH_PORT + 1))
+        COA_PORT=$((AUTH_PORT + 2000))
+        INNER_PORT=$((AUTH_PORT + 5000))
+
+        echo ""
+        header "======================================================"
+        header "  Creating Instance: $ADMIN_USERNAME"
+        header "======================================================"
+        echo "  Database   : $DB_NAME"
+        echo "  DB User    : $DB_USER"
+        echo "  DB Password: $DB_PASS"
+        echo "  Auth Port  : $AUTH_PORT"
+        echo "  Acct Port  : $ACCT_PORT   (auth+1)"
+        echo "  CoA  Port  : $COA_PORT    (auth+2000)"
+        echo "  Inner Port : $INNER_PORT  (auth+5000)"
+        header "======================================================"
+        echo ""
+
+        # Simpan info instance
+        INFO_FILE="$FREERADIUS_DIR/.instance_${ADMIN_USERNAME}"
+        cat > "$INFO_FILE" << INFOEOF
+ADMIN_USERNAME=${ADMIN_USERNAME}
+DB_NAME=${DB_NAME}
+DB_USER=${DB_USER}
+DB_PASS=${DB_PASS}
+AUTH_PORT=${AUTH_PORT}
+ACCT_PORT=${ACCT_PORT}
+COA_PORT=${COA_PORT}
+INNER_PORT=${INNER_PORT}
+CREATED=$(date '+%Y-%m-%d %H:%M:%S')
+INFOEOF
+        chmod 600 "$INFO_FILE"
+
+        test_mariadb                                               || exit 1
+        create_database       "$DB_NAME" "$DB_USER" "$DB_PASS"
+        import_schema         "$DB_NAME"
+        create_sql_module     "$ADMIN_USERNAME" "$DB_NAME" "$DB_USER" "$DB_PASS"
+        create_eap_module     "$ADMIN_USERNAME" "$INNER_PORT"
+        create_inner_tunnel   "$ADMIN_USERNAME" "$INNER_PORT"
+        create_virtual_server "$ADMIN_USERNAME" "$AUTH_PORT"
+        create_log_dir        "$ADMIN_USERNAME"
+        register_port         "$AUTH_PORT" "$ADMIN_USERNAME"
+        restart_freeradius
+
+        echo ""
+        header "======================================================"
+        success "Instance '$ADMIN_USERNAME' berhasil dibuat!"
+        echo ""
+        echo "  Auth Port  : $AUTH_PORT"
+        echo "  Acct Port  : $ACCT_PORT"
+        echo "  DB Name    : $DB_NAME"
+        echo "  DB User    : $DB_USER"
+        echo "  DB Pass    : $DB_PASS"
+        echo ""
+        echo "  Tambahkan NAS ke database:"
+        echo "  ----------------------------------------"
+        echo "  mariadb ${DB_NAME}"
+        echo ""
+        echo "  INSERT INTO nas (nasname, shortname, type, secret, server)"
+        echo "  VALUES ("
+        echo "    'IP_MIKROTIK',"
+        echo "    'nama_nas',"
+        echo "    'other',"
+        echo "    'secret_mikrotik',"
+        echo "    '${ADMIN_USERNAME}'"
+        echo "  );"
+        echo "  ----------------------------------------"
+        echo ""
+        echo "  Info  : $0 info $ADMIN_USERNAME"
+        echo "  List  : $0 list"
+        header "======================================================"
+        echo ""
+        ;;
+
+    # ------------------------------------------
+    delete)
+        if [ $# -lt 2 ]; then
+            echo "Usage: $0 delete <admin> [--with-db]"
+            echo ""
+            echo "  --with-db   Hapus juga database & user MariaDB"
+            echo ""
+            echo "Contoh:"
+            echo "  $0 delete replaymedia            # config saja"
+            echo "  $0 delete replaymedia --with-db  # config + database"
+            exit 1
+        fi
+
+        ADMIN_USERNAME=$2
+        WITH_DB="${3:-}"
+        INFO_FILE="$FREERADIUS_DIR/.instance_${ADMIN_USERNAME}"
+
+        echo ""
+        header "======================================================"
+        header "  Deleting Instance: $ADMIN_USERNAME"
+        header "======================================================"
+
+        if [ "${WITH_DB}" = "--with-db" ]; then
+            if [ -f "$INFO_FILE" ]; then
+                source "$INFO_FILE"
+                test_mariadb || exit 1
+                drop_database "$DB_NAME" "$DB_USER"
+            else
+                warning "File info tidak ditemukan, skip drop database"
+            fi
+        else
+            info "Hanya config yang dihapus (tambah --with-db untuk hapus database)"
+        fi
+
+        delete_config "$ADMIN_USERNAME"
+        rm -f "$INFO_FILE"
+
+        LOG_PATH="$LOG_DIR/radacct-${ADMIN_USERNAME}"
+        if [ -d "$LOG_PATH" ]; then
+            echo ""
+            read -r -p "Hapus log directory ${LOG_PATH}? [y/N] " confirm_log
+            echo ""
+            if [[ "${confirm_log}" =~ ^[Yy]$ ]]; then
+                rm -rf "$LOG_PATH"
+                success "Log directory dihapus"
+            else
+                info "Log directory dibiarkan: $LOG_PATH"
+            fi
+        fi
+
+        restart_freeradius
+        echo ""
+        success "Instance '$ADMIN_USERNAME' dihapus!"
+        echo ""
+        ;;
+
+    # ------------------------------------------
+    stop)
+        [ $# -ge 2 ] || { echo "Usage: $0 stop <admin>"; exit 1; }
+        stop_instance "$2"
+        restart_freeradius
+        ;;
+
+    # ------------------------------------------
+    start)
+        [ $# -ge 2 ] || { echo "Usage: $0 start <admin>"; exit 1; }
+        start_instance "$2"
+        restart_freeradius
+        ;;
+
+    # ------------------------------------------
+    restart)
+        restart_freeradius
+        ;;
+
+    # ------------------------------------------
+    list)
+        list_instances
+        ;;
+
+    # ------------------------------------------
+    test)
+        [ $# -ge 2 ] || { echo "Usage: $0 test <admin>"; exit 1; }
+        test_instance "$2"
+        ;;
+
+    # ------------------------------------------
+    test-disconnect)
+        [ $# -ge 4 ] || {
+            echo "Usage: $0 test-disconnect <admin> <username> <session-id>"
+            exit 1
+        }
+        test_disconnect "$2" "$3" "$4"
+        ;;
+
+    # ------------------------------------------
+    info)
+        [ $# -ge 2 ] || { echo "Usage: $0 info <admin>"; exit 1; }
+        INFO_FILE="$FREERADIUS_DIR/.instance_${2}"
+        [ -f "$INFO_FILE" ] || { error "Info tidak ditemukan: $2"; exit 1; }
+        echo ""
+        header "=== Instance: $2 ==="
+        cat "$INFO_FILE"
+        echo ""
+        ;;
+
+    # ------------------------------------------
+    *)
+        echo ""
+        header "FreeRADIUS Multi-Instance Manager"
+        header "=================================="
+        echo ""
+        echo "Usage: $0 {command} [options]"
+        echo ""
+        echo "  create <admin> [db_pass]           Buat instance + database baru"
+        echo "  delete <admin> [--with-db]         Hapus instance"
+        echo "                  --with-db          + hapus database & user MariaDB"
+        echo "  stop   <admin>                     Nonaktifkan instance"
+        echo "  start  <admin>                     Aktifkan instance"
+        echo "  restart                            Restart FreeRADIUS"
+        echo "  list                               Lihat semua instance"
+        echo "  test   <admin>                     Test instance"
+        echo "  test-disconnect <admin> <u> <sid>  CoA Disconnect"
+        echo "  info   <admin>                     Detail instance"
+        echo ""
+        echo "Contoh:"
+        echo "  $0 create replaymedia"
+        echo "  $0 create baimnabil MyPass123"
+        echo "  $0 list"
+        echo "  $0 info replaymedia"
+        echo "  $0 stop replaymedia"
+        echo "  $0 start replaymedia"
+        echo "  $0 delete replaymedia --with-db"
+        echo ""
+        exit 1
+        ;;
+esac
+
+exit 0
