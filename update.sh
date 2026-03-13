@@ -6,6 +6,10 @@ FREERADIUS_DIR="/etc/freeradius/3.0"
 API_DIR_BASE="/root"
 LOG_PREFIX="[$(date '+%Y-%m-%d %H:%M:%S')]"
 
+S3_REMOTE="ljns3"
+S3_BUCKET="backup-db"
+S3_BACKUP_ROOT="radiusdb"
+
 info()    { echo "${LOG_PREFIX} [INFO]  $*"; }
 success() { echo "${LOG_PREFIX} [OK]    $*"; }
 warning() { echo "${LOG_PREFIX} [WARN]  $*"; }
@@ -81,6 +85,23 @@ for INFO_FILE in "$FREERADIUS_DIR"/.instance_*; do
             "${API_DIR}/autoclearzombie.sh"
         chmod +x "${API_DIR}/autoclearzombie.sh"
         success "autoclearzombie.sh di-patch ulang"
+    fi
+
+    # Ada update — patch autobackups3.sh jika ada
+    if [ -f "${API_DIR}/autobackups3.sh" ]; then
+        info "Re-patch credentials autobackups3.sh..."
+        sed -i \
+            -e "s|^REMOTE=.*|REMOTE=\"${S3_REMOTE}\"|" \
+            -e "s|^BUCKET=.*|BUCKET=\"${S3_BUCKET}\"|" \
+            -e "s|^BACKUP_PATH=.*|BACKUP_PATH=\"${S3_BACKUP_ROOT}/${ADMIN_USERNAME}\"|" \
+            -e "s|^DB_HOST=.*|DB_HOST=\"${DB_HOST}\"|" \
+            -e "s|^DB_PORT=.*|DB_PORT=\"${DB_PORT}\"|" \
+            -e "s|^DB_USER=.*|DB_USER=\"${DB_USER}\"|" \
+            -e "s|^DB_PASS=.*|DB_PASS=\"${DB_PASS}\"|" \
+            -e "s|^DB_NAME=.*|DB_NAME=\"${DB_NAME}\"|" \
+            "${API_DIR}/autobackups3.sh"
+        chmod +x "${API_DIR}/autobackups3.sh"
+        success "autobackups3.sh di-patch ulang"
     fi
 
     # Restart service

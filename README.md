@@ -26,8 +26,9 @@ Script utama untuk membuat, mengelola, dan menghapus instance FreeRADIUS beserta
 4. Membuat virtual server & inner tunnel dengan port acak yang belum terpakai
 5. Meng-clone repo [freeradius-api](https://github.com/heirro/freeradius-api) ke `/root/<nama>-api/`
 6. Mengisi `.env` API dengan credentials database dan Swagger secara otomatis
-7. Mengisi credentials di `autoclearzombie.sh` secara otomatis
-8. Membuat dan mengaktifkan systemd service untuk REST API
+7. Mengisi credentials di `autoclearzombie.sh` + membuat cron job (tiap 30 menit)
+8. Mengisi credentials di `autobackups3.sh` + membuat cron job backup S3 (tiap hari jam 02:00)
+9. Membuat dan mengaktifkan systemd service untuk REST API
 
 ### Port yang di-assign per instance
 
@@ -149,9 +150,27 @@ INSERT INTO nas (nasname, shortname, type, secret, server)
 VALUES ('IP_MIKROTIK', 'nama_nas', 'other', 'secret_radius', '<nama>');
 ```
 
+### Konfigurasi S3 Backup
+
+Ubah variabel berikut di bagian CONFIGURATION `radius-manager.sh` sesuai setup rclone:
+
+```bash
+S3_REMOTE="ljns3"          # Nama remote rclone
+S3_BUCKET="backup-db"      # Nama bucket
+S3_BACKUP_ROOT="radiusdb"  # Root path di bucket (folder per instance: radiusdb/<nama>)
+S3_BACKUP_SCHEDULE="0 2 * * *"  # Jadwal cron (default: tiap hari jam 02:00)
+```
+
+Pastikan `rclone` sudah terinstall dan remote `ljns3` sudah dikonfigurasi:
+
+```bash
+apt install rclone
+rclone config  # Setup remote ljns3
+```
+
 ---
 
-## update-api.sh
+## update.sh
 
 Script untuk meng-update semua instance API secara otomatis via `git pull`, cocok dijalankan sebagai cron job.
 
@@ -161,6 +180,7 @@ Script untuk meng-update semua instance API secara otomatis via `git pull`, coco
 2. Menjalankan `git pull` di direktori API masing-masing instance
 3. Jika **ada update**:
    - Re-patch credentials di `autoclearzombie.sh` (agar tidak tertimpa hasil pull)
+   - Re-patch credentials di `autobackups3.sh` (agar tidak tertimpa hasil pull)
    - Restart systemd service instance tersebut
 4. Jika **Already up to date** — skip, service tidak diganggu
 

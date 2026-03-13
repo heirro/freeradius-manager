@@ -38,6 +38,11 @@ API_DIR_BASE="/root"
 API_REPO="https://github.com/heirro/freeradius-api"
 PORT_API_START=8100
 
+S3_REMOTE="ljns3"
+S3_BUCKET="backup-db"
+S3_BACKUP_ROOT="radiusdb"
+S3_BACKUP_SCHEDULE="0 2 * * *"   # Tiap hari jam 02:00
+
 # ============================================
 # COLORS
 # ============================================
@@ -967,6 +972,33 @@ ENVEOF
         fi
     fi
 
+    # Patch autobackups3.sh dengan credentials
+    if [ -f "${API_DIR}/autobackups3.sh" ]; then
+        info "Mengisi credentials di autobackups3.sh..."
+        sed -i \
+            -e "s|^REMOTE=.*|REMOTE=\"${S3_REMOTE}\"|" \
+            -e "s|^BUCKET=.*|BUCKET=\"${S3_BUCKET}\"|" \
+            -e "s|^BACKUP_PATH=.*|BACKUP_PATH=\"${S3_BACKUP_ROOT}/${A}\"|" \
+            -e "s|^DB_HOST=.*|DB_HOST=\"${DB_HOST}\"|" \
+            -e "s|^DB_PORT=.*|DB_PORT=\"${DB_PORT}\"|" \
+            -e "s|^DB_USER=.*|DB_USER=\"${DB_USER}\"|" \
+            -e "s|^DB_PASS=.*|DB_PASS=\"${DB_PASS}\"|" \
+            -e "s|^DB_NAME=.*|DB_NAME=\"${DB_NAME}\"|" \
+            "${API_DIR}/autobackups3.sh"
+        chmod +x "${API_DIR}/autobackups3.sh"
+        success "autobackups3.sh dikonfigurasi (S3: ${S3_REMOTE}:${S3_BUCKET}/${S3_BACKUP_ROOT}/${A})"
+
+        # Buat cron job backup S3
+        local CRON_BACKUP="${S3_BACKUP_SCHEDULE} ${API_DIR}/autobackups3.sh >> /var/log/autobackups3-${A}.log 2>&1"
+        local CRON_BACKUP_MARKER="autobackups3-${A}"
+        if crontab -l 2>/dev/null | grep -qF "$CRON_BACKUP_MARKER"; then
+            warning "Cron autobackups3-${A} sudah ada, skip"
+        else
+            ( crontab -l 2>/dev/null; echo "$CRON_BACKUP" ) | crontab -
+            success "Cron backup S3 dibuat: ${CRON_BACKUP}"
+        fi
+    fi
+
     # Setup Python venv
     info "Setting up Python venv..."
     python3 -m venv "${API_DIR}/venv" >/dev/null 2>&1 || {
@@ -1043,6 +1075,14 @@ delete_api() {
         success "Cron job autoclearzombie-${A} dihapus"
     else
         info "Cron autoclearzombie-${A} tidak ditemukan, skip"
+    fi
+
+    # Hapus cron job backup S3
+    if crontab -l 2>/dev/null | grep -qF "autobackups3-${A}"; then
+        crontab -l 2>/dev/null | grep -vF "autobackups3-${A}" | crontab -
+        success "Cron job autobackups3-${A} dihapus"
+    else
+        info "Cron autobackups3-${A} tidak ditemukan, skip"
     fi
 
     if [ -d "$API_DIR" ]; then
